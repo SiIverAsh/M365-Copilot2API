@@ -3,6 +3,7 @@ package web
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -110,13 +112,24 @@ func (p *pipeResponseWriter) Flush() {}
 // streamResponsesAdapter converts the internal OpenAI SSE incrementally instead
 // of buffering the entire completion in httptest.ResponseRecorder.
 func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, o oaiReq, model string) {
+	streamResponsesFromChat(w, r, o, model, s.openaiChat, responsesKeepaliveInterval)
+}
+
+const responsesKeepaliveInterval = 15 * time.Second
+
+func streamResponsesFromChat(w http.ResponseWriter, r *http.Request, o oaiReq, model string, chat http.HandlerFunc, keepaliveInterval time.Duration) {
 	o.Stream = true
 	b, _ := json.Marshal(o)
-	r2 := r.Clone(r.Context())
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	r2 := r.Clone(ctx)
 	r2.Method = http.MethodPost
 	r2.Body = io.NopCloser(bytes.NewReader(b))
 	r2.ContentLength = int64(len(b))
 	pr, pw := io.Pipe()
+	// An error frame terminates the adapter before the producer necessarily
+	// finishes writing. Closing the reader releases any blocked pipe write.
+	defer pr.Close()
 	irw := &pipeResponseWriter{h: make(http.Header), w: pw}
 	innerDone := make(chan struct{})
 	go func() {
@@ -127,19 +140,94 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			_ = pw.Close()
 			close(innerDone)
 		}()
-		s.openaiChat(irw, r2)
+		chat(irw, r2)
 	}()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher, _ := w.(http.Flusher)
+	var writeMu sync.Mutex
+	finished := false
+	writeFrame := func(payload string, terminal bool) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if finished {
+			return nil
+		}
+		err := ctx.Err()
+		if err == nil {
+			finished = terminal
+			err = sseSafeRaw(w, flusher, payload)
+		}
+		if err != nil {
+			finished = true
+			cancel()
+			_ = pr.CloseWithError(err)
+		}
+		return err
+	}
 	emit := func(name string, v any) error {
-		return writeSSE(r, w, flusher, name, v)
+		b, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		return writeFrame(fmt.Sprintf("event: %s\ndata: %s\n\n", name, b), name == "response.completed" || name == "response.failed")
 	}
 	id := "resp_" + uuid.NewString()
 	created := time.Now().Unix()
-	emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
+	if err := emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}}); err != nil {
+		return
+	}
+	// Keep the public connection alive even while the inner chat has not
+	// emitted anything. All frames share the write lock, including terminals.
+	ticker := time.NewTicker(keepaliveInterval)
+	keepaliveStop := make(chan struct{})
+	keepaliveDone := make(chan struct{})
+	defer func() {
+		ticker.Stop()
+		close(keepaliveStop)
+		<-keepaliveDone
+	}()
+	go func() {
+		defer close(keepaliveDone)
+		for {
+			select {
+			case <-keepaliveStop:
+				return
+			case <-ctx.Done():
+				_ = pr.CloseWithError(ctx.Err())
+				return
+			case <-ticker.C:
+				if err := writeFrame(": keepalive\n\n", false); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	emitFailure := func(raw any) {
+		errObj, _ := raw.(map[string]any)
+		code, _ := errObj["code"].(string)
+		typ, _ := errObj["type"].(string)
+		message, _ := errObj["message"].(string)
+		if message == "" {
+			message, _ = raw.(string)
+		}
+		failure := map[string]any{
+			"code":    firstNonEmpty(code, typ, "upstream_error"),
+			"message": sanitizePublicInternalText(firstNonEmpty(message, "inner chat request failed")),
+		}
+		if typ != "" {
+			failure["type"] = typ
+		}
+		_ = emit("response.failed", map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"id": id, "object": "response", "status": "failed", "model": model,
+				"error": failure,
+			},
+		})
+	}
 
 	var text strings.Builder
 	messageID := "msg_" + uuid.NewString()
@@ -153,15 +241,26 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	scanner := bufio.NewScanner(pr)
 	scanner.Buffer(make([]byte, 4096), 2<<20)
 	for scanner.Scan() {
-		if r.Context().Err() != nil {
+		if ctx.Err() != nil {
 			return
 		}
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+		isData := strings.HasPrefix(line, "data:")
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "[DONE]" {
 			continue
 		}
 		var chunk map[string]any
-		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk) != nil {
+		if json.Unmarshal([]byte(payload), &chunk) != nil {
+			continue
+		}
+		// Streaming failures arrive inside HTTP 200 SSE bodies; failures
+		// before streaming starts arrive as a plain JSON error instead.
+		if upstreamErr, ok := chunk["error"]; ok && upstreamErr != nil {
+			emitFailure(upstreamErr)
+			return
+		}
+		if !isData {
 			continue
 		}
 		choices, _ := chunk["choices"].([]any)
@@ -229,8 +328,12 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		emitFailure(map[string]any{"code": "upstream_stream_error", "message": err.Error()})
+		return
+	}
 	<-innerDone
-	if scanner.Err() != nil || irw.status >= http.StatusBadRequest {
+	if irw.status >= http.StatusBadRequest {
 		status := irw.status
 		if status == 0 {
 			status = http.StatusBadGateway

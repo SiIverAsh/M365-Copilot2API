@@ -1259,15 +1259,12 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// resolveWaitWindow bounds how long account selection will wait for a cooling
-// account to recover before giving up and reporting the failure.
+// Transport recovery allows a full 30s cooldown. Keep the
+// shorter existing budget for other failures such as upstream rate limits.
 const (
-	resolveWaitWindow = 12 * time.Second
-	resolveMaxWait    = 5 * time.Second
-	// Several jittered attempts, not one: under burst load every account can be
-	// cooling simultaneously, and a single fixed wait just makes all queued
-	// requests retry together and collide again.
-	resolveWaitAttempts = 3
+	resolveWaitWindow          = 12 * time.Second
+	resolveTransportWaitWindow = 30 * time.Second
+	resolveMaxWait             = 5 * time.Second
 )
 
 func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
@@ -1277,7 +1274,11 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 // resolveAccountCtx is resolveAccount with request cancellation and a bounded
 // wait for imminent recovery.
 func (s *Server) resolveAccountCtx(ctx context.Context, accountID string) (auth.AccountToken, error) {
-	return s.resolveAccountUntil(ctx, accountID, time.Now().Add(resolveWaitWindow))
+	window := resolveWaitWindow
+	if cat, at := s.accountPool.LastCategory(); IsTransportCategory(cat) && time.Since(at) < 5*time.Minute {
+		window = resolveTransportWaitWindow
+	}
+	return s.resolveAccountUntil(ctx, accountID, time.Now().Add(window))
 }
 
 // jitterDuration returns a random duration in [0, max). It uses crypto/rand
@@ -1347,6 +1348,9 @@ func (s *Server) tryResolve(ctx context.Context) (auth.AccountToken, bool) {
 // (bounded by deadline) instead of failing the request, so a client never has
 // to implement its own retry/backoff for a blip the gateway can absorb.
 func (s *Server) resolveAccountUntil(ctx context.Context, accountID string, deadline time.Time) (auth.AccountToken, error) {
+	if err := ctx.Err(); err != nil {
+		return auth.AccountToken{}, err
+	}
 	if accountID == "" {
 		// Failover mode: try the last healthy account first, then round-robin.
 		// Every candidate is validated with EnsureValid before use, so an account
@@ -1375,10 +1379,15 @@ func (s *Server) resolveAccountUntil(ctx context.Context, accountID string, dead
 		// out and the accounts can drain.
 		until := s.accountPool.EarliestRecovery()
 		if !until.IsZero() {
-			for attempt := 0; attempt < resolveWaitAttempts; attempt++ {
+			for time.Now().Before(deadline) {
 				wait := time.Until(until)
-				if wait > resolveMaxWait || time.Now().Add(wait).After(deadline) {
+				if time.Now().Add(wait).After(deadline) {
 					break
+				}
+				// Poll during longer cooldowns so an account that recovers early
+				// can be used. The per-poll cap must not reject the 30s cooldown.
+				if wait > resolveMaxWait {
+					wait = resolveMaxWait
 				}
 				if wait < 0 {
 					wait = 0
@@ -1395,13 +1404,16 @@ func (s *Server) resolveAccountUntil(ctx context.Context, accountID string, dead
 					timer.Stop()
 					return auth.AccountToken{}, ctx.Err()
 				case <-timer.C:
-					if tok, ok := s.tryResolve(ctx); ok {
-						return tok, nil
-					}
-					until = s.accountPool.EarliestRecovery()
-					if until.IsZero() {
-						break
-					}
+				}
+				if err := ctx.Err(); err != nil {
+					return auth.AccountToken{}, err
+				}
+				if tok, ok := s.tryResolve(ctx); ok {
+					return tok, nil
+				}
+				until = s.accountPool.EarliestRecovery()
+				if until.IsZero() {
+					break
 				}
 			}
 		}

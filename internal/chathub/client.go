@@ -139,9 +139,9 @@ func wrapDialError(err error, status int, retryAfter int) *DialError {
 }
 
 // Phase is the 7-stage state machine for a ChatHub exchange.
-// Only PayloadSent is zero-side-effect and retriable; once streaming has
-// begun (any text, tool event or reused conversation) failover must not
-// switch accounts.
+// A fresh request can reconnect before streaming starts. A continuation can
+// reconnect only before its payload is sent, to avoid replaying an existing
+// conversation turn.
 type Phase int
 
 const (
@@ -377,6 +377,51 @@ func poolEligibleFor(req Request) bool {
 }
 
 func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler) (Result, error) {
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		result, err := c.chatAttempt(ctx, acc, req, onDelta, onEvent, attempt == 0)
+		if err != nil && ctx.Err() != nil {
+			return result, ctx.Err()
+		}
+		var reconnectErr *reconnectableChatError
+		if !errors.As(err, &reconnectErr) {
+			return result, err
+		}
+		if attempt == 1 {
+			return result, reconnectErr.Unwrap()
+		}
+		log.Printf("chathub transport failure; reconnecting once with a fresh socket: %v", reconnectErr.Unwrap())
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return Result{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// Internal marker: the public entry point unwraps it after the single retry.
+type reconnectableChatError struct{ err error }
+
+func (e *reconnectableChatError) Error() string { return e.err.Error() }
+func (e *reconnectableChatError) Unwrap() error { return e.err }
+
+func isReconnectableTransportError(err error) bool {
+	var dialErr *DialError
+	if !errors.As(err, &dialErr) || dialErr.Status != 0 {
+		return false
+	}
+	switch dialErr.Kind {
+	case "SOCKS5", "DNS", "TCP", "TLS", "WS_HANDSHAKE", "WS_READ_TIMEOUT", "WS_WRITE_TIMEOUT":
+		return true
+	}
+	return false
+}
+
+func (c *Client) chatAttempt(ctx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler, usePool bool) (result Result, err error) {
 	startedAt := time.Now()
 	log.Printf("chathub timing start prompt_len=%d", len(req.Text))
 	if acc.AccessToken == "" || acc.OID == "" || acc.TID == "" {
@@ -416,7 +461,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		return Result{}, err
 	}
 	phase := PhaseInit
-	_ = phase
+	defer func() {
+		if ctx.Err() == nil && isReconnectableTransportError(err) &&
+			(phase < PhasePayloadSent || poolEligible && IsRetriablePhase(phase)) {
+			err = &reconnectableChatError{err: err}
+		}
+	}()
 	attachCh := make(chan error, 1)
 	if len(req.Attachments) > 0 {
 		go func() { attachCh <- c.uploadAttachments(ctx, acc, req.ConversationID, req.Attachments) }()
@@ -427,7 +477,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	var reused bool
 	phase = PhaseDial
 
-	if c.Pool != nil {
+	if c.Pool != nil && usePool {
 		if !poolEligible {
 			// Continuation requests must dial fresh; skip pool Take entirely.
 		} else {
@@ -492,6 +542,8 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	wsWrite := func(msgType int, data []byte) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+		// Each write, including later heartbeats, gets its own timeout window.
+		_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 		return conn.WriteMessage(msgType, data)
 	}
 
@@ -520,7 +572,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
-	_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 
 	if !reused {
 		if err := wsWrite(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
@@ -543,7 +594,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		}
 	}
 
-	_ = wsWrite(websocket.TextMessage, []byte(`{"type":6}`+rs))
+	if err := wsWrite(websocket.TextMessage, []byte(`{"type":6}`+rs)); err != nil {
+		return Result{}, wrapDialError(err, 0, 0)
+	}
 
 	payload := chatPayload(req, requestID, firstTurn)
 	log.Printf("chathub prompt-trace text=%d tools=%d payload=%d", len(req.Text), len(req.Tools), len(payload))
@@ -557,6 +610,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	log.Printf("chathub timing handshake_ms=%d", time.Since(dialStarted).Milliseconds())
 	payloadSentAt := time.Now()
 	ts := Timestamps{RequestSent: payloadSentAt.UTC().Format(time.RFC3339Nano)}
+	// A failed write can still have sent part of the payload. Treat a
+	// continuation as submitted before writing, so it is never replayed.
+	phase = PhasePayloadSent
 	if err := wsWrite(websocket.TextMessage, []byte(payload)); err != nil {
 		returnConn = false
 		if errors.Is(err, context.Canceled) {
@@ -564,7 +620,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		}
 		return Result{}, &DialError{Status: 0, Kind: classifyTransportError(err), cause: fmt.Errorf("chat send: %w", err)}
 	}
-	phase = PhasePayloadSent
 	var firstTokenTimer *time.Timer
 	var firstTokenTimeout <-chan time.Time
 	if req.FirstTokenTimeout > 0 {
@@ -583,6 +638,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		phase = PhaseStreaming
 		if chTrace {
 			log.Printf("[trace:emitDelta] len=%d streamed=%d preview=%q", len(d), streamed.Len()+len(d), truncate(d, 80))
 		}
@@ -594,7 +650,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 			log.Printf("chathub timing first_delta_ms=%d len=%d", time.Since(payloadSentAt).Milliseconds(), len(d))
 			ts.FirstTokenReceived = time.Now().UTC().Format(time.RFC3339Nano)
-			phase = PhaseStreaming
 		}
 		streamed.WriteString(d)
 		deltas = append(deltas, d)
@@ -793,7 +848,10 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 
 			// SignalR ping
 			if int(t) == 6 {
-				_ = wsWrite(websocket.TextMessage, []byte(`{"type":6}`+rs))
+				if err := wsWrite(websocket.TextMessage, []byte(`{"type":6}`+rs)); err != nil {
+					returnConn = false
+					return Result{}, wrapDialError(err, 0, 0)
+				}
 				continue
 			}
 
@@ -805,20 +863,20 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						continue
 					}
 					msgs, _ := arg["messages"].([]any)
-					if onEvent != nil {
-						beforeTools := len(seenStreamTools)
-						for _, ev := range extractToolEvents(arg, seenStreamTools) {
+					for _, ev := range extractToolEvents(arg, seenStreamTools) {
+						phase = PhaseStreaming
+						if onEvent != nil {
 							if err := onEvent(ev); err != nil {
 								returnConn = false
 								return Result{}, err
 							}
 						}
-						if len(seenStreamTools) > beforeTools {
-							phase = PhaseStreaming
-						}
 					}
 
 					for _, ev := range classifyUpdateMessages(msgs) {
+						if ev.Kind != "text" {
+							phase = PhaseStreaming
+						}
 						if ev.Kind == "reasoning" {
 							reasoningBuf.WriteString(ev.Text)
 						}
@@ -959,6 +1017,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 
 			if int(t) == 2 {
+				phase = PhaseStreaming
 				item, _ := obj["item"].(map[string]any)
 				if item != nil {
 					if smid, ok := item["storageMessageId"].(string); ok && smid != "" {
